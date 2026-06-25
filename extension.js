@@ -73,7 +73,7 @@ async function getActiveConnections() {
         let randomise = null;
         if (connType.includes('wireless')) {
             const val = await runCommandAsync(
-                [NMCLI, '-t', '-f', 'wifi.cloned-mac-address', 'connection', 'show', uuid]
+                [NMCLI, '-t', '-f', '802-11-wireless.cloned-mac-address', 'connection', 'show', uuid]
             );
             const s = val.split(':').slice(1).join(':').trim().toLowerCase();
             if (s && s !== '--') randomise = s === 'random' || s === 'stable' || s === 'stable-ssid';
@@ -92,7 +92,7 @@ async function getActiveConnections() {
 
 function setRandomiseAsync(uuid, connType, enable) {
     let field;
-    if (connType.includes('wireless')) field = 'wifi.cloned-mac-address';
+    if (connType.includes('wireless')) field = '802-11-wireless.cloned-mac-address';
     else if (connType.includes('ethernet')) field = '802-3-ethernet.cloned-mac-address';
     else return;
     runCommandAsync([NMCLI, 'connection', 'modify', uuid, field, enable ? 'random' : 'permanent']);
@@ -110,7 +110,7 @@ class MacRandomiserIndicator extends PanelMenu.Button {
         this._refreshTimer = null;
 
         this._icon = new St.Icon({
-            icon_name: 'network-wireless-symbolic',
+            icon_name: 'security-high-symbolic',
             style_class: 'system-status-icon',
         });
         this.add_child(this._icon);
@@ -121,6 +121,11 @@ class MacRandomiserIndicator extends PanelMenu.Button {
             y_align: 2, // CENTER
         });
         this.add_child(this._statusLabel);
+
+        // Refresh label when menu closes
+        this.menu.connect('open-state-changed', (_menu, open) => {
+            if (!open) this._refreshAsync();
+        });
 
         // Build initial menu
         this._buildStaticMenu();
@@ -150,9 +155,7 @@ class MacRandomiserIndicator extends PanelMenu.Button {
             this._conns = conns;
             const on = conns.some(c => c.randomise === true);
             this._statusLabel.text = on ? 'Randomised' : 'Static';
-            this._icon.icon_name = on
-                ? 'network-wireless-symbolic'
-                : 'network-wireless-offline-symbolic';
+            this._icon.icon_name = 'security-high-symbolic';
             this._rebuildMenu(conns);
         }).catch(() => {
             this._statusLabel.text = 'Error';
@@ -174,8 +177,9 @@ class MacRandomiserIndicator extends PanelMenu.Button {
                 macLabel.sensitive = false;
                 this.menu.addMenuItem(macLabel);
 
-                if (conn.permMac && conn.permMac !== conn.activeMac.toUpperCase()) {
-                    const permLabel = new PopupMenu.PopupMenuItem(`Permanent MAC: ${conn.permMac}`);
+                // Always show permanent MAC when randomisation is off; only when different when on
+                if (conn.permMac && (conn.randomise !== true || conn.permMac !== conn.activeMac.toUpperCase())) {
+                    const permLabel = new PopupMenu.PopupMenuItem("Permanent MAC: " + conn.permMac);
                     permLabel.sensitive = false;
                     this.menu.addMenuItem(permLabel);
                 }
@@ -186,7 +190,10 @@ class MacRandomiserIndicator extends PanelMenu.Button {
                     );
                     toggle.connect('toggled', (_item, state) => {
                         setRandomiseAsync(conn.uuid, conn.connType, state);
-                        this._refreshAsync();
+                        GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
+                            this._refreshAsync();
+                            return GLib.SOURCE_REMOVE;
+                        });
                     });
                     this.menu.addMenuItem(toggle);
                 }

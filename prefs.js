@@ -98,7 +98,7 @@ function getAllConnections() {
  */
 function getRandomiseSetting(uuid, connType) {
     let field;
-    if (connType && connType.includes('wireless')) field = 'wifi.cloned-mac-address';
+    if (connType && connType.includes('wireless')) field = '802-11-wireless.cloned-mac-address';
     else if (connType && connType.includes('ethernet')) field = '802-3-ethernet.cloned-mac-address';
     else return null; // vpn, loopback etc. — not applicable
 
@@ -117,7 +117,7 @@ function getRandomiseSetting(uuid, connType) {
  */
 function setRandomise(uuid, connType, enable) {
     let field;
-    if (connType && connType.includes('wireless')) field = 'wifi.cloned-mac-address';
+    if (connType && connType.includes('wireless')) field = '802-11-wireless.cloned-mac-address';
     else if (connType && connType.includes('ethernet')) field = '802-3-ethernet.cloned-mac-address';
     else return; // can't set for vpn/loopback
 
