@@ -1,12 +1,14 @@
-import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import Gtk from 'gi://Gtk';
 import Adw from 'gi://Adw';
 import { ExtensionPreferences, gettext as _ } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
 // ---------------------------------------------------------------------------
-// Helpers — run nmcli synchronously and return stdout as a string
+// Helpers
 // ---------------------------------------------------------------------------
+
+const NMCLI   = '/usr/bin/nmcli';
+const ETHTOOL = '/usr/bin/ethtool';
 
 function runCommand(argv) {
     try {
@@ -24,103 +26,102 @@ function runCommand(argv) {
 // ---------------------------------------------------------------------------
 
 /**
- * Returns an array of interface objects:
- *   { name: string, permMac: string }
- * Covers all interfaces known to NetworkManager (wifi, ethernet, etc.)
+ * Returns devices from NM, excluding lo and p2p virtual interfaces.
+ * Each entry: { name, type, permMac, activeMac }
+ *   type: 'wifi' | 'ethernet' | 'other'
  */
-function getInterfaces() {
-    // nmcli -t -f DEVICE,PERM-HW-ADDRESS device show
-    const raw = runCommand(['nmcli', '-t', '-f', 'GENERAL.DEVICE,GENERAL.HWADDR,CAPABILITIES.SPEED', 'device', 'show']);
+function getDevices() {
+    // Get device list with type info
+    const raw = runCommand([NMCLI, '-t', '-f', 'GENERAL.DEVICE,GENERAL.TYPE,GENERAL.HWADDR', 'device', 'show']);
     if (!raw) return [];
 
-    const interfaces = [];
+    const devices = [];
     let current = {};
 
     for (const line of raw.split('\n')) {
-        const [key, ...rest] = line.split(':');
-        const value = rest.join(':').trim(); // re-join in case MAC has colons
+        const colonIdx = line.indexOf(':');
+        if (colonIdx === -1) continue;
+        const key = line.slice(0, colonIdx);
+        const value = line.slice(colonIdx + 1).trim();
 
         if (key === 'GENERAL.DEVICE') {
-            current = { name: value, permMac: null };
+            current = { name: value, type: 'other', permMac: _('Unknown'), activeMac: null };
+        } else if (key === 'GENERAL.TYPE') {
+            if (value.includes('wifi') || value.includes('wireless')) current.type = 'wifi';
+            else if (value.includes('ethernet')) current.type = 'ethernet';
         } else if (key === 'GENERAL.HWADDR') {
-            current.permMac = value || _('Unknown');
-            interfaces.push(current);
+            current.activeMac = value && value !== '--' ? value : null;
+            // Only push once we have all three fields
+            const name = current.name;
+            if (name && name !== 'lo' && !name.startsWith('p2p-dev-')) {
+                devices.push({ ...current });
+            }
         }
     }
 
-    return interfaces.filter(i => i.name && i.name !== 'lo');
+    // Get permanent MACs via ethtool
+    for (const dev of devices) {
+        const out = runCommand([ETHTOOL, '-P', dev.name]);
+        const match = out.match(/Permanent address:\s*([0-9a-fA-F:]{17})/);
+        if (match) dev.permMac = match[1].toUpperCase();
+    }
+
+    return devices;
 }
 
 /**
- * Returns an array of connection objects for a given interface:
- *   { uuid: string, name: string, randomise: boolean|null }
- *
- * randomise is:
- *   true  → wifi.cloned-mac-address = random  OR  802-3-ethernet.cloned-mac-address = random
- *   false → set to something else (permanent, preserve, default, or a specific MAC)
- *   null  → key not present (falls back to NetworkManager global default)
+ * Returns all saved connections with randomise state and their NM connection type.
+ * Each entry: { uuid, name, connType, randomise }
+ *   connType: '802-11-wireless' | '802-3-ethernet' | 'vpn' | 'loopback' | ...
  */
-function getConnectionsForDevice(ifaceName) {
-    // List connections associated with this device
-    const raw = runCommand(['nmcli', '-t', '-f', 'UUID,NAME,DEVICE', 'connection', 'show']);
+function getAllConnections() {
+    const raw = runCommand([NMCLI, '-t', '-f', 'UUID,NAME,TYPE', 'connection', 'show']);
     if (!raw) return [];
 
     const conns = [];
     for (const line of raw.split('\n')) {
+        // UUID is 36 chars with hyphens, so split carefully
         const parts = line.split(':');
         if (parts.length < 3) continue;
-        const [uuid, name, device] = parts;
-        // Include connections associated with this device OR unassigned (device == '--')
-        if (device === ifaceName || device === '--') {
-            const randomise = getRandomiseSetting(uuid);
-            conns.push({ uuid, name, randomise });
-        }
+        const uuid = parts[0];
+        const connType = parts[parts.length - 1]; // last field is TYPE
+        const name = parts.slice(1, parts.length - 1).join(':'); // middle is NAME
+        const randomise = getRandomiseSetting(uuid, connType);
+        conns.push({ uuid, name, connType, randomise });
     }
     return conns;
 }
 
 /**
- * Reads the cloned-mac-address field for a connection and interprets it.
- * Returns: true (random), false (not random), or null (not set / using global default).
+ * Reads the cloned-mac-address setting for a connection.
+ * Returns: true (randomised), false (permanent), null (using global NM default).
  */
-function getRandomiseSetting(uuid) {
-    // Try wifi first, then ethernet
-    for (const field of ['wifi.cloned-mac-address', '802-3-ethernet.cloned-mac-address']) {
-        const val = runCommand(['nmcli', '-t', '-f', field, 'connection', 'show', uuid]);
-        if (!val) continue;
+function getRandomiseSetting(uuid, connType) {
+    let field;
+    if (connType && connType.includes('wireless')) field = 'wifi.cloned-mac-address';
+    else if (connType && connType.includes('ethernet')) field = '802-3-ethernet.cloned-mac-address';
+    else return null; // vpn, loopback etc. — not applicable
 
-        // Output format: "wifi.cloned-mac-address:random"
-        const parts = val.split(':');
-        if (parts.length < 2) continue;
-        const setting = parts.slice(1).join(':').trim().toLowerCase();
+    const val = runCommand([NMCLI, '-t', '-f', field, 'connection', 'show', uuid]);
+    if (!val) return null;
 
-        if (setting === '' || setting === '--') continue; // field not applicable
-        return setting === 'random' || setting === 'stable' || setting === 'stable-ssid';
-    }
-    return null; // not configured — will use NM global default
+    const colonIdx = val.indexOf(':');
+    if (colonIdx === -1) return null;
+    const setting = val.slice(colonIdx + 1).trim().toLowerCase();
+    if (!setting || setting === '--') return null;
+    return setting === 'random' || setting === 'stable' || setting === 'stable-ssid';
 }
 
 /**
- * Sets (or clears) MAC randomisation for a connection.
- * type: 'wifi' | 'ethernet' — determined by probing the connection type.
+ * Sets MAC randomisation for a connection.
  */
-function setRandomise(uuid, enable) {
-    // Detect connection type
-    const typeRaw = runCommand(['nmcli', '-t', '-f', 'connection.type', 'connection', 'show', uuid]);
-    const connType = typeRaw.split(':').slice(1).join(':').trim().toLowerCase();
-
+function setRandomise(uuid, connType, enable) {
     let field;
-    if (connType.includes('wireless') || connType.includes('wifi')) {
-        field = 'wifi.cloned-mac-address';
-    } else if (connType.includes('ethernet')) {
-        field = '802-3-ethernet.cloned-mac-address';
-    } else {
-        // Generic fallback — try wifi field
-        field = 'wifi.cloned-mac-address';
-    }
+    if (connType && connType.includes('wireless')) field = 'wifi.cloned-mac-address';
+    else if (connType && connType.includes('ethernet')) field = '802-3-ethernet.cloned-mac-address';
+    else return; // can't set for vpn/loopback
 
-    const value = enable ? 'random' : 'permanent';
-    runCommand(['nmcli', 'connection', 'modify', uuid, field, value]);
+    runCommand([NMCLI, 'connection', 'modify', uuid, field, enable ? 'random' : 'permanent']);
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +133,9 @@ export default class MacRandomiserPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         window.set_title(_('MAC Randomiser'));
         window.set_default_size(700, 600);
+
+        const devices = getDevices();
+        const allConns = getAllConnections();
 
         // ── Page: Interfaces ───────────────────────────────────────────────
         const ifacePage = new Adw.PreferencesPage({
@@ -146,19 +150,14 @@ export default class MacRandomiserPreferences extends ExtensionPreferences {
         });
         ifacePage.add(ifaceGroup);
 
-        const interfaces = getInterfaces();
-
-        if (interfaces.length === 0) {
-            const emptyRow = new Adw.ActionRow({ title: _('No interfaces found') });
-            ifaceGroup.add(emptyRow);
+        if (devices.length === 0) {
+            ifaceGroup.add(new Adw.ActionRow({ title: _('No interfaces found') }));
         } else {
-            for (const iface of interfaces) {
+            for (const dev of devices) {
                 const row = new Adw.ActionRow({
-                    title: iface.name,
-                    subtitle: iface.permMac ?? _('Unknown'),
+                    title: dev.name,
+                    subtitle: dev.permMac,
                 });
-
-                // Copy-to-clipboard button
                 const copyBtn = new Gtk.Button({
                     icon_name: 'edit-copy-symbolic',
                     valign: Gtk.Align.CENTER,
@@ -166,33 +165,25 @@ export default class MacRandomiserPreferences extends ExtensionPreferences {
                     css_classes: ['flat'],
                 });
                 copyBtn.connect('clicked', () => {
-                    const clipboard = window.get_clipboard();
-                    clipboard.set(iface.permMac ?? '');
+                    window.get_clipboard().set(dev.permMac);
                 });
                 row.add_suffix(copyBtn);
-
                 ifaceGroup.add(row);
             }
         }
 
         // Refresh button
-        const ifaceRefreshGroup = new Adw.PreferencesGroup();
-        ifacePage.add(ifaceRefreshGroup);
-
-        const refreshIfaceRow = new Adw.ActionRow({
-            title: _('Refresh interface list'),
-        });
-        const refreshIfaceBtn = new Gtk.Button({
+        const refreshGroup = new Adw.PreferencesGroup();
+        ifacePage.add(refreshGroup);
+        const refreshRow = new Adw.ActionRow({ title: _('Refresh interface list') });
+        const refreshBtn = new Gtk.Button({
             label: _('Refresh'),
             valign: Gtk.Align.CENTER,
             css_classes: ['suggested-action'],
         });
-        refreshIfaceBtn.connect('clicked', () => {
-            // Re-open preferences to force a full reload
-            this.openPreferences();
-        });
-        refreshIfaceRow.add_suffix(refreshIfaceBtn);
-        ifaceRefreshGroup.add(refreshIfaceRow);
+        refreshBtn.connect('clicked', () => this.openPreferences());
+        refreshRow.add_suffix(refreshBtn);
+        refreshGroup.add(refreshRow);
 
         // ── Page: Connections ──────────────────────────────────────────────
         const connPage = new Adw.PreferencesPage({
@@ -201,75 +192,79 @@ export default class MacRandomiserPreferences extends ExtensionPreferences {
         });
         window.add(connPage);
 
-        this._buildConnectionsPage(connPage, interfaces);
+        this._buildConnectionsPage(connPage, devices, allConns);
     }
 
-    _buildConnectionsPage(page, interfaces) {
-        // Group all connections, bucketed by device
-        const deviceNames = interfaces.map(i => i.name);
+    _buildConnectionsPage(page, devices, allConns) {
         const seen = new Set();
 
-        // Also grab connections with no active device
-        for (const iface of [{ name: null }, ...interfaces]) {
-            const conns = iface.name
-                ? getConnectionsForDevice(iface.name).filter(c => !seen.has(c.uuid))
-                : this._getOrphanConnections(seen);
+        // Bucket connections by matching NM connection type to device type
+        for (const dev of devices) {
+            const devConns = allConns.filter(c => {
+                if (seen.has(c.uuid)) return false;
+                if (dev.type === 'wifi') return c.connType.includes('wireless');
+                if (dev.type === 'ethernet') return c.connType.includes('ethernet');
+                return false;
+            });
 
-            if (conns.length === 0) continue;
-
-            conns.forEach(c => seen.add(c.uuid));
+            if (devConns.length === 0) continue;
+            devConns.forEach(c => seen.add(c.uuid));
 
             const group = new Adw.PreferencesGroup({
-                title: iface.name ? `${_('Device')}: ${iface.name}` : _('Other / Unassigned Connections'),
-                description: iface.name
-                    ? _('Toggle MAC randomisation per saved connection.')
-                    : _('Connections not currently associated with a detected device.'),
+                title: `${dev.name}`,
+                description: _('Current MAC: %s').replace('%s', dev.activeMac ?? _('not connected')),
             });
             page.add(group);
 
-            for (const conn of conns) {
-                this._addConnectionRow(group, conn);
+            for (const conn of devConns) {
+                this._addConnectionRow(group, conn, dev.activeMac);
             }
         }
 
-        if (seen.size === 0) {
+        // Remaining connections (vpn, loopback, unmatched)
+        const remaining = allConns.filter(c => !seen.has(c.uuid) &&
+            !c.connType.includes('loopback'));
+
+        if (remaining.length > 0) {
+            const group = new Adw.PreferencesGroup({
+                title: _('Other Connections'),
+                description: _('VPN and other connection types — MAC randomisation not applicable.'),
+            });
+            page.add(group);
+            for (const conn of remaining) {
+                group.add(new Adw.ActionRow({
+                    title: conn.name,
+                    subtitle: conn.connType,
+                }));
+            }
+        }
+
+        if (allConns.length === 0) {
             const emptyGroup = new Adw.PreferencesGroup({ title: _('Connections') });
             page.add(emptyGroup);
             emptyGroup.add(new Adw.ActionRow({ title: _('No saved connections found.') }));
         }
     }
 
-    _getOrphanConnections(seen) {
-        const raw = runCommand(['nmcli', '-t', '-f', 'UUID,NAME,DEVICE', 'connection', 'show']);
-        if (!raw) return [];
-        const conns = [];
-        for (const line of raw.split('\n')) {
-            const parts = line.split(':');
-            if (parts.length < 3) continue;
-            const [uuid, name] = parts;
-            if (!seen.has(uuid)) {
-                const randomise = getRandomiseSetting(uuid);
-                conns.push({ uuid, name, randomise });
-            }
-        }
-        return conns;
-    }
+    _addConnectionRow(group, conn, activeMac = null) {
+        const enabledLabel = activeMac
+            ? _('Randomisation enabled — current MAC: %s').replace('%s', activeMac)
+            : _('Randomisation enabled');
 
-    _addConnectionRow(group, conn) {
         const row = new Adw.SwitchRow({
             title: conn.name,
             subtitle: conn.randomise === null
                 ? _('Using global NetworkManager default')
                 : conn.randomise
-                    ? _('Randomisation enabled')
+                    ? enabledLabel
                     : _('Randomisation disabled (permanent MAC)'),
             active: conn.randomise === true,
         });
 
         row.connect('notify::active', () => {
-            setRandomise(conn.uuid, row.active);
+            setRandomise(conn.uuid, conn.connType, row.active);
             row.subtitle = row.active
-                ? _('Randomisation enabled')
+                ? enabledLabel
                 : _('Randomisation disabled (permanent MAC)');
         });
 

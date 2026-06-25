@@ -2,7 +2,7 @@
   "name": "MAC Randomiser",
   "description": "Manage MAC address randomisation per network connection via NetworkManager.",
   "uuid": "mac-randomiser@quantumcs.co.uk",
-  "version": 1,
-  "shell-version": ["45", "46", "47", "48"],
+  "version": 2,
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
   "url": ""
 }
